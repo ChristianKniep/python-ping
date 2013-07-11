@@ -24,7 +24,7 @@ import socket
 import struct
 import sys
 import time
-
+import statsd
 
 if sys.platform.startswith("win32"):
     # On Windows, the best timer is time.clock()
@@ -88,6 +88,7 @@ def to_ip(addr):
 
 class Ping(object):
     def __init__(self, destination, timeout=1000, packet_size=55, own_id=None):
+        self.statsd_connection = None
         self.destination = destination
         self.timeout = timeout
         self.packet_size = packet_size
@@ -95,7 +96,17 @@ class Ping(object):
             self.own_id = os.getpid() & 0xFFFF
         else:
             self.own_id = own_id
+        self.seq_number = 0
+        self.send_count = 0
+        self.receive_count = 0
+        self.min_time = 999999999
+        self.max_time = 0.0
+        self.total_time = 0.0
 
+    def setup(self):
+        """
+        wramp up the destination
+        """
         try:
             # FIXME: Use destination only for display this line here? see: https://github.com/jedie/python-ping/issues/3
             self.dest_ip = to_ip(self.destination)
@@ -104,55 +115,64 @@ class Ping(object):
         else:
             self.print_start()
 
-        self.seq_number = 0
-        self.send_count = 0
-        self.receive_count = 0
-        self.min_time = 999999999
-        self.max_time = 0.0
-        self.total_time = 0.0
-
+        
+        
     #--------------------------------------------------------------------------
 
     def print_start(self):
-        print("\nPYTHON-PING %s (%s): %d data bytes" % (self.destination, self.dest_ip, self.packet_size))
+        if self.statsd_connection == None:
+            print("\nPYTHON-PING %s (%s): %d data bytes" % (self.destination, self.dest_ip, self.packet_size))
 
     def print_unknown_host(self, e):
         print("\nPYTHON-PING: Unknown host: %s (%s)\n" % (self.destination, e.args[1]))
         sys.exit(-1)
 
     def print_success(self, delay, ip, packet_size, ip_header, icmp_header):
-        if ip == self.destination:
-            from_info = ip
+        if self.statsd_connection == None:
+            if ip == self.destination:
+                from_info = ip
+            else:
+                from_info = "%s (%s)" % (self.destination, ip)
+    
+            print("%d bytes from %s: icmp_seq=%d ttl=%d time=%.1f ms" % (
+                packet_size, from_info, icmp_header["seq_number"], ip_header["ttl"], delay)
+            )
+            #print("IP header: %r" % ip_header)
+            #print("ICMP header: %r" % icmp_header)
         else:
-            from_info = "%s (%s)" % (self.destination, ip)
-
-        print("%d bytes from %s: icmp_seq=%d ttl=%d time=%.1f ms" % (
-            packet_size, from_info, icmp_header["seq_number"], ip_header["ttl"], delay)
-        )
-        #print("IP header: %r" % ip_header)
-        #print("ICMP header: %r" % icmp_header)
+            pass
 
     def print_failed(self):
         print("Request timed out.")
 
     def print_exit(self):
-        print("\n----%s PYTHON PING Statistics----" % (self.destination))
-
-        lost_count = self.send_count - self.receive_count
-        #print("%i packets lost" % lost_count)
-        lost_rate = float(lost_count) / self.send_count * 100.0
-
-        print("%d packets transmitted, %d packets received, %0.1f%% packet loss" % (
-            self.send_count, self.receive_count, lost_rate
-        ))
-
-        if self.receive_count > 0:
-            print("round-trip (ms)  min/avg/max = %0.3f/%0.3f/%0.3f" % (
-                self.min_time, self.total_time / self.receive_count, self.max_time
+        if self.statsd_connection == None:
+            print("\n----%s PYTHON PING Statistics----" % (self.destination))
+    
+            lost_count = self.send_count - self.receive_count
+            #print("%i packets lost" % lost_count)
+            lost_rate = float(lost_count) / self.send_count * 100.0
+    
+            print("%d packets transmitted, %d packets received, %0.1f%% packet loss" % (
+                self.send_count, self.receive_count, lost_rate
             ))
-
-        print("")
-
+    
+            if self.receive_count > 0:
+                print("round-trip (ms)  min/avg/max = %0.3f/%0.3f/%0.3f" % (
+                    self.min_time, self.total_time / self.receive_count, self.max_time
+                ))
+    
+            print("")
+    
+    #-------------------------------------------------------------------------
+    # statsd
+    def connect_statsd(self, host='localhost', port=8125, sample_rate=1):
+        self.statsd_connection = statsd.Connection(host=host, port=port, sample_rate=sample_rate)
+        self.delay_timer = statsd.Timer("PingTest", self.statsd_connection)
+        
+    def statsd_send_delay(self, delay):
+        self.delay_timer.send(self.destination.replace(".", "_"), delay)
+    
     #--------------------------------------------------------------------------
 
     def signal_handler(self, signum, frame):
@@ -182,6 +202,7 @@ class Ping(object):
         """
         send and receive pings in a loop. Stop if count or until deadline.
         """
+        assert self.dest_ip != None, "Please use setup() prior to run/do"
         self.setup_signal_handler()
 
         while True:
@@ -206,6 +227,7 @@ class Ping(object):
         """
         Send one ICMP ECHO_REQUEST and receive the response until self.timeout
         """
+        assert self.dest_ip != None, "Please use setup() prior to run/do"
         try: # One could use UDP here, but it's obscure
             current_socket = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.getprotobyname("icmp"))
         except socket.error, (errno, msg):
@@ -229,6 +251,8 @@ class Ping(object):
         if receive_time:
             self.receive_count += 1
             delay = (receive_time - send_time) * 1000.0
+            self.statsd_send_delay(delay)
+            
             self.total_time += delay
             if self.min_time > delay:
                 self.min_time = delay
@@ -244,6 +268,7 @@ class Ping(object):
         """
         Send one ICMP ECHO_REQUEST
         """
+        assert self.dest_ip != None, "Please use setup() prior to run/do"
         # Header is type (8), code (8), checksum (16), id (16), sequence (16)
         checksum = 0
 
@@ -284,6 +309,7 @@ class Ping(object):
         """
         Receive the ping from the socket. timeout = in ms
         """
+        assert self.dest_ip != None, "Please use setup() prior to run/do"
         timeout = self.timeout / 1000.0
 
         while True: # Loop while waiting for packet or timeout
@@ -328,7 +354,19 @@ class Ping(object):
 
 def verbose_ping(hostname, timeout=1000, count=3, packet_size=55):
     p = Ping(hostname, timeout, packet_size)
+    p.setup()
     p.run(count)
+    
+def statsd_ping(hostname, timeout=1000, count=2, packet_size=55):
+    p = Ping(hostname, timeout, packet_size)
+    p.connect_statsd('grumpy0')
+    p.setup()
+    while True:
+        try:
+            p.run(count)
+            time.sleep(5)
+        except KeyboardInterrupt:
+            break
 
 
 if __name__ == '__main__':
@@ -353,6 +391,7 @@ if __name__ == '__main__':
         # Should fails with 'The requested address is not valid in its context':
         verbose_ping("0.0.0.0")
     elif len(sys.argv) == 2:
-        verbose_ping(sys.argv[1])
+        #verbose_ping(sys.argv[1])
+        statsd_ping(sys.argv[1])
     else:
         print "Error: call ./ping.py domain.tld"
